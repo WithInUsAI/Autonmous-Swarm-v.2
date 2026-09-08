@@ -1,0 +1,127 @@
+"""
+Model adapters.
+
+llama-cpp-python will happily call create_chat_completion() on any GGUF
+and *usually* get a reasonable result via the template baked into the
+model's metadata — but "usually" isn't good enough once agents are
+calling tools and each other. FunctionGemma in particular is a
+function-calling-tuned model, not a generic chat model, and expects to
+be talked to like one. The Specialist and Executor need the tool
+schema in front of them to produce arguments that actually validate.
+
+Each adapter owns:
+  - build_messages(): how to phrase the system/user turn for this model
+  - parse_structured(): how to pull a JSON object back out, if the
+    agent's job is to produce one (router route, tool call arguments)
+
+Swap in a real per-model chat_format / jinja template here once you've
+confirmed each GGUF's actual template (llama_cpp.Llama exposes
+`chat_format` and can load a custom `chat_handler` — this is the seam
+for that; see the class docstrings below).
+"""
+
+from typing import Optional
+
+from .json_utils import extract_json
+from .router import ROUTE_SCHEMA_INSTRUCTIONS
+
+
+class ModelAdapter:
+    """Default adapter: plain system+user turn, relies on the GGUF's own
+    baked-in chat template via llama.cpp's auto-detection."""
+
+    def build_messages(self, system_prompt: str, user_prompt: str, context: Optional[dict] = None) -> list[dict]:
+        return [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+
+    def parse_structured(self, text: str) -> Optional[dict]:
+        return extract_json(text)
+
+
+class MiniCPMThinkingAdapter(ModelAdapter):
+    """Reasoner / Critic. Plain chat turn is fine for these — they're
+    used for free-text plans and verdicts, not structured output.
+    If your build of these GGUFs expects an explicit <think> wrapper,
+    that goes here (wrap user_prompt, then strip the wrapper back out
+    of the response in parse_structured or in the director)."""
+    pass
+
+
+class MiniCPMTooluseAdapter(ModelAdapter):
+    """Executor. Gets the live tool schema appended to its system
+    prompt so it knows exactly which tools exist and what arguments
+    they take, and is asked to emit a structured call when it wants one."""
+
+    def build_messages(self, system_prompt: str, user_prompt: str, context: Optional[dict] = None) -> list[dict]:
+        tool_schema = (context or {}).get("tool_schema", [])
+        tools_block = "\n".join(
+            f"- {t['name']}({', '.join(t['parameters'].keys())}): {t['description']}"
+            for t in tool_schema
+        )
+        sys_prompt = (
+            f"{system_prompt}\n\nAvailable tools:\n{tools_block}\n\n"
+            "If you need a tool, end your reply with a single JSON object on its "
+            'own line: {"tool": "<name>", "arguments": {...}}. If no tool is '
+            "needed, just answer directly with no JSON."
+        )
+        return [
+            {"role": "system", "content": sys_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+
+    def parse_structured(self, text: str) -> Optional[dict]:
+        data = extract_json(text)
+        if data and "tool" in data:
+            return data
+        return None
+
+
+class FunctionGemmaAdapter(ModelAdapter):
+    """Router. Small function-calling-tuned model — kept on the shortest,
+    most rigid leash: one strict JSON schema, nothing else."""
+
+    def build_messages(self, system_prompt: str, user_prompt: str, context: Optional[dict] = None) -> list[dict]:
+        sys_prompt = f"{system_prompt}\n\n{ROUTE_SCHEMA_INSTRUCTIONS}"
+        return [
+            {"role": "system", "content": sys_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+
+    def parse_structured(self, text: str) -> Optional[dict]:
+        return extract_json(text)
+
+
+class LFMFunctionAdapter(ModelAdapter):
+    """Specialist. Turns the Executor's requested tool call into
+    validated, schema-conformant arguments."""
+
+    def build_messages(self, system_prompt: str, user_prompt: str, context: Optional[dict] = None) -> list[dict]:
+        tool_schema = (context or {}).get("tool_schema", [])
+        requested = (context or {}).get("requested_tool")
+        schema_block = ""
+        if requested:
+            match = next((t for t in tool_schema if t["name"] == requested), None)
+            if match:
+                schema_block = f"\n\nTarget tool schema:\n{match}"
+        sys_prompt = (
+            f"{system_prompt}{schema_block}\n\n"
+            'Respond with ONLY a JSON object: {"tool": "<name>", "arguments": {...}}'
+        )
+        return [
+            {"role": "system", "content": sys_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+
+    def parse_structured(self, text: str) -> Optional[dict]:
+        return extract_json(text)
+
+
+ADAPTERS = {
+    "ModelAdapter": ModelAdapter,
+    "MiniCPMThinkingAdapter": MiniCPMThinkingAdapter,
+    "MiniCPMTooluseAdapter": MiniCPMTooluseAdapter,
+    "FunctionGemmaAdapter": FunctionGemmaAdapter,
+    "LFMFunctionAdapter": LFMFunctionAdapter,
+}
