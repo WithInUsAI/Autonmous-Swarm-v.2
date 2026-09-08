@@ -1,0 +1,349 @@
+import math
+import time
+from typing import Optional
+
+from PyQt6.QtCore import Qt, QTimer, QRectF
+from PyQt6.QtGui import QColor, QPainter, QFont
+from PyQt6.QtWidgets import (
+    QMainWindow, QWidget, QGraphicsView, QGraphicsScene, QVBoxLayout, QHBoxLayout,
+    QSplitter, QLabel, QTextEdit, QLineEdit, QPushButton, QListWidget, QListWidgetItem,
+    QProgressBar, QGridLayout, QCheckBox,
+)
+
+from config import AGENT_CONFIGS, AGENT_ORDER, MAX_SWARM_CYCLES
+from swarm.engine import SwarmEngine, LLAMA_AVAILABLE
+from swarm.tools import ToolRegistry
+from swarm.director import MissionWorker
+from .graph import AgentNode, DirectorNode, Connection, AgentStatus
+from .styles import DARK_STYLESHEET
+
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("GOD SWARM COMMAND CENTER — V2  (Autonomous Tool-Using Recursive Swarm)")
+        self.resize(1360, 860)
+        self.setStyleSheet(DARK_STYLESHEET)
+
+        self.engine = SwarmEngine()
+        self.tools = ToolRegistry()
+        self.worker: Optional[MissionWorker] = None
+        self.nodes: dict[str, AgentNode] = {}
+        self.connections: list[tuple[str, str, Connection]] = []
+
+        self._build_ui()
+        self._build_scene()
+        self._start_clock()
+
+    # ---------------- UI SKELETON ----------------
+
+    def _build_ui(self):
+        central = QWidget()
+        self.setCentralWidget(central)
+        root = QVBoxLayout(central)
+        root.setContentsMargins(10, 8, 10, 8)
+        root.setSpacing(6)
+
+        topbar = QHBoxLayout()
+        title = QLabel("GOD SWARM COMMAND CENTER — V2")
+        title.setObjectName("TitleBar")
+        topbar.addWidget(title)
+        topbar.addStretch(1)
+        self.status_pill = QLabel("● SYSTEM ONLINE" if LLAMA_AVAILABLE else "● llama-cpp-python NOT INSTALLED")
+        self.status_pill.setObjectName("StatusPill")
+        if not LLAMA_AVAILABLE:
+            self.status_pill.setStyleSheet("color:#f2a93b;font-weight:bold;")
+        topbar.addWidget(self.status_pill)
+        self.cycle_label = QLabel("")
+        self.cycle_label.setStyleSheet("color:#e6c15c;font-weight:bold;")
+        topbar.addWidget(self.cycle_label)
+        self.clock_label = QLabel("00:00:00")
+        self.clock_label.setStyleSheet("color:#6b7280;")
+        topbar.addWidget(self.clock_label)
+        root.addLayout(topbar)
+
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        root.addWidget(splitter, 1)
+
+        # LEFT: swarm status + mode + permissions
+        left = QWidget()
+        left_l = QVBoxLayout(left)
+        left_l.addWidget(self._section_label("SWARM STATUS"))
+        self.status_list = QListWidget()
+        for key in AGENT_ORDER:
+            cfg = AGENT_CONFIGS[key]
+            item = QListWidgetItem(f"●  {cfg['name']}")
+            item.setForeground(QColor(cfg["color"]))
+            self.status_list.addItem(item)
+        left_l.addWidget(self.status_list, 1)
+
+        left_l.addWidget(self._section_label("MODE"))
+        self.simulate_checkbox = QCheckBox("Simulate (no real inference)")
+        self.simulate_checkbox.setChecked(not LLAMA_AVAILABLE)
+        left_l.addWidget(self.simulate_checkbox)
+
+        left_l.addWidget(self._section_label("TOOL PERMISSIONS"))
+        self.tools_enabled_checkbox = QCheckBox("Enable tool registry")
+        self.tools_enabled_checkbox.setChecked(True)
+        self.tools_enabled_checkbox.toggled.connect(self._on_tools_toggled)
+        left_l.addWidget(self.tools_enabled_checkbox)
+        self.run_python_checkbox = QCheckBox("Allow run_python")
+        self.run_python_checkbox.setChecked(True)
+        self.run_python_checkbox.toggled.connect(self._on_run_python_toggled)
+        left_l.addWidget(self.run_python_checkbox)
+        workspace_lbl = QLabel(f"sandbox: {self.tools.workspace_dir}")
+        workspace_lbl.setStyleSheet("color:#6b7280;font-size:9px;")
+        workspace_lbl.setWordWrap(True)
+        left_l.addWidget(workspace_lbl)
+
+        left_l.addWidget(self._section_label("TOOL ACTIVITY"))
+        self.tool_activity = QTextEdit()
+        self.tool_activity.setReadOnly(True)
+        left_l.addWidget(self.tool_activity, 1)
+
+        splitter.addWidget(left)
+
+        # CENTER: graph + task bar + event stream
+        center = QWidget()
+        center_l = QVBoxLayout(center)
+        center_l.setContentsMargins(0, 0, 0, 0)
+
+        self.scene = QGraphicsScene()
+        self.view = QGraphicsView(self.scene)
+        self.view.setRenderHint(QPainter.RenderHint.Antialiasing)
+        self.view.setDragMode(QGraphicsView.DragMode.RubberBandDrag)
+        center_l.addWidget(self.view, 3)
+
+        task_row = QHBoxLayout()
+        self.task_input = QLineEdit()
+        self.task_input.setPlaceholderText("Tell the swarm what you want it to accomplish...")
+        self.task_input.returnPressed.connect(self._on_execute)
+        task_row.addWidget(self.task_input, 1)
+        self.btn_execute = QPushButton("▶ EXECUTE")
+        self.btn_execute.clicked.connect(self._on_execute)
+        task_row.addWidget(self.btn_execute)
+        self.btn_pause = QPushButton("PAUSE")
+        self.btn_pause.setCheckable(True)
+        self.btn_pause.clicked.connect(self._on_pause)
+        task_row.addWidget(self.btn_pause)
+        self.btn_stop = QPushButton("STOP")
+        self.btn_stop.clicked.connect(self._on_stop)
+        task_row.addWidget(self.btn_stop)
+        self.btn_clear = QPushButton("CLEAR")
+        self.btn_clear.clicked.connect(self._on_clear)
+        task_row.addWidget(self.btn_clear)
+        center_l.addLayout(task_row)
+
+        center_l.addWidget(self._section_label("EVENT STREAM"))
+        self.event_console = QTextEdit()
+        self.event_console.setReadOnly(True)
+        self.event_console.setFixedHeight(180)
+        center_l.addWidget(self.event_console)
+
+        splitter.addWidget(center)
+
+        # RIGHT: telemetry + inspector
+        right = QWidget()
+        right_l = QVBoxLayout(right)
+        right_l.addWidget(self._section_label("LIVE TELEMETRY"))
+        telemetry_grid = QGridLayout()
+        self.telemetry_bars: dict[str, QProgressBar] = {}
+        for i, key in enumerate(AGENT_ORDER):
+            cfg = AGENT_CONFIGS[key]
+            lbl = QLabel(cfg["name"])
+            lbl.setStyleSheet(f"color:{cfg['color']};font-size:10px;")
+            bar = QProgressBar()
+            bar.setRange(0, 80)
+            bar.setValue(0)
+            bar.setFormat("%v tok/s")
+            telemetry_grid.addWidget(lbl, i, 0)
+            telemetry_grid.addWidget(bar, i, 1)
+            self.telemetry_bars[key] = bar
+        right_l.addLayout(telemetry_grid)
+
+        right_l.addWidget(self._section_label("AGENT INSPECTOR"))
+        self.inspector = QTextEdit()
+        self.inspector.setReadOnly(True)
+        right_l.addWidget(self.inspector, 1)
+        splitter.addWidget(right)
+
+        splitter.setSizes([260, 760, 320])
+
+    def _section_label(self, text: str) -> QLabel:
+        lbl = QLabel(text)
+        lbl.setObjectName("SectionHeader")
+        return lbl
+
+    # ---------------- SCENE ----------------
+
+    def _build_scene(self):
+        self.scene.setSceneRect(-420, -260, 840, 560)
+        director = DirectorNode(0, -160)
+        self.scene.addItem(director)
+        self.director = director
+
+        radius = 190
+        n = len(AGENT_ORDER)
+        for i, key in enumerate(AGENT_ORDER):
+            angle = (2 * math.pi / n) * i - math.pi / 2
+            x = radius * math.cos(angle)
+            y = 40 + radius * math.sin(angle)
+            cfg = AGENT_CONFIGS[key]
+            node = AgentNode(key, cfg, self.engine.agents[key].available, x, y)
+            node.set_click_handler(self._on_node_clicked)
+            self.scene.addItem(node)
+            self.nodes[key] = node
+
+        for key in AGENT_ORDER:
+            conn = Connection(self.director, self.nodes[key])
+            self.scene.addItem(conn)
+            self.connections.append(("director", key, conn))
+
+        for a, b in zip(AGENT_ORDER, AGENT_ORDER[1:] + AGENT_ORDER[:1]):
+            conn = Connection(self.nodes[a], self.nodes[b])
+            self.scene.addItem(conn)
+            self.connections.append((a, b, conn))
+
+        self.view.fitInView(self.scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
+
+    def _start_clock(self):
+        self._t0 = time.time()
+        timer = QTimer(self)
+        timer.timeout.connect(self._tick_clock)
+        timer.start(1000)
+
+    def _tick_clock(self):
+        elapsed = int(time.time() - self._t0)
+        h, rem = divmod(elapsed, 3600)
+        m, s = divmod(rem, 60)
+        self.clock_label.setText(f"{h:02d}:{m:02d}:{s:02d}")
+
+    # ---------------- SETTINGS ----------------
+
+    def _on_tools_toggled(self, checked: bool):
+        self.tools.enabled = checked
+
+    def _on_run_python_toggled(self, checked: bool):
+        self.tools.allow_run_python = checked
+
+    # ---------------- EVENTS ----------------
+
+    def _log(self, line: str):
+        ts = time.strftime("%H:%M:%S")
+        self.event_console.append(f"{ts}  {line}")
+
+    def _log_tool(self, line: str):
+        ts = time.strftime("%H:%M:%S")
+        self.tool_activity.append(f"{ts}  {line}")
+
+    def _on_node_clicked(self, key: str):
+        cfg = AGENT_CONFIGS[key]
+        agent = self.engine.agents[key]
+        node = self.nodes[key]
+        lines = [
+            f"{cfg['name'].upper()}",
+            "",
+            f"STATUS       {node.status.value}",
+            f"MODEL FILE   {cfg['file']}",
+            f"ADAPTER      {cfg['adapter']}",
+            f"AVAILABLE    {'yes' if agent.available else 'no (missing file or llama-cpp-python)'}",
+            "",
+            f"ROLE         {cfg['role']}",
+            f"TEMPERATURE  {cfg['temperature']}",
+            f"MAX TOKENS   {cfg['max_tokens']}",
+            f"CONTEXT      {cfg['n_ctx']}",
+            "",
+            f"CALLS        {agent.calls}",
+            f"ERRORS       {agent.errors}",
+            f"TOK/S        {agent.last_tokens_per_sec:0.1f}",
+        ]
+        self.inspector.setPlainText("\n".join(lines))
+
+    def _on_execute(self):
+        task = self.task_input.text().strip()
+        if not task:
+            return
+        if self.worker and self.worker.isRunning():
+            self._log("Mission already running — stop it first.")
+            return
+        self.event_console.clear()
+        self.tool_activity.clear()
+        self.inspector.clear()
+        self.cycle_label.setText("")
+        self.director.cycle_text = ""
+        self.director.active = True
+        self.director.update()
+
+        simulate = self.simulate_checkbox.isChecked()
+        self.worker = MissionWorker(self.engine, self.tools, task, simulate)
+        self.worker.event.connect(self._log)
+        self.worker.agent_status.connect(self._on_agent_status)
+        self.worker.agent_stream.connect(self._on_agent_stream)
+        self.worker.connection_pulse.connect(self._on_connection_pulse)
+        self.worker.tool_call.connect(self._on_tool_call)
+        self.worker.tool_result.connect(self._on_tool_result)
+        self.worker.cycle_update.connect(self._on_cycle_update)
+        self.worker.telemetry.connect(self._on_telemetry)
+        self.worker.mission_finished.connect(self._on_mission_finished)
+        self.worker.start()
+        self.btn_execute.setEnabled(False)
+
+    def _on_pause(self, checked: bool):
+        if self.worker:
+            self.worker.toggle_pause(checked)
+        self.btn_pause.setText("RESUME" if checked else "PAUSE")
+
+    def _on_stop(self):
+        if self.worker:
+            self.worker.stop()
+            self._log("STOP requested — cancelling at next token boundary.")
+        self.btn_execute.setEnabled(True)
+
+    def _on_clear(self):
+        self.event_console.clear()
+        self.tool_activity.clear()
+        self.inspector.clear()
+
+    def _on_agent_status(self, key: str, status_value: str):
+        node = self.nodes.get(key)
+        if node:
+            node.set_status(AgentStatus(status_value))
+        self.director.active = status_value == "THINKING"
+        self.director.update()
+
+    def _on_agent_stream(self, key: str, partial_text: str):
+        pass  # kept light in V2 as in V1; wire to a per-node tooltip/panel if desired
+
+    def _on_connection_pulse(self, from_key: str, to_key: str, kind: str):
+        for a, b, conn in self.connections:
+            if (a == from_key and b == to_key) or (a == to_key and b == from_key):
+                conn.fire_pulse(kind)
+                return
+
+    def _on_tool_call(self, tool_name: str, arguments_repr: str):
+        self._log_tool(f"CALL  {tool_name}({arguments_repr})")
+
+    def _on_tool_result(self, tool_name: str, result_text: str, ok: bool):
+        tag = "OK" if ok else "FAIL"
+        self._log_tool(f"{tag}  {tool_name} → {result_text}")
+
+    def _on_cycle_update(self, cycle: int, max_cycles: int):
+        self.cycle_label.setText(f"CYCLE {cycle}/{max_cycles}")
+        self.director.cycle_text = f"{cycle}/{max_cycles}"
+        self.director.update()
+
+    def _on_telemetry(self, key: str, tokens_per_sec: float):
+        node = self.nodes.get(key)
+        if node:
+            node.tokens_per_sec = tokens_per_sec
+            node.update()
+        bar = self.telemetry_bars.get(key)
+        if bar:
+            bar.setValue(min(80, int(tokens_per_sec)))
+
+    def _on_mission_finished(self, success: bool):
+        self.btn_execute.setEnabled(True)
+        self.btn_pause.setChecked(False)
+        self.btn_pause.setText("PAUSE")
+        self.director.active = False
+        self.director.update()
