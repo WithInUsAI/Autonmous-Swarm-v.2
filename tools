@@ -1,0 +1,189 @@
+"""
+ToolRegistry — the only thing that ever touches the real world on the
+model's behalf. Models never get raw shell access (per design decision:
+no arbitrary shell command tool). Every call is:
+
+    structured request -> schema validation -> permission check
+    -> execution -> sanitized result
+
+All filesystem tools are sandboxed to WORKSPACE_DIR; path traversal
+outside it is rejected.
+"""
+
+import os
+import subprocess
+import sys
+from dataclasses import dataclass
+from typing import Any, Callable, Optional
+
+from config import WORKSPACE_DIR
+
+
+@dataclass
+class ToolResult:
+    ok: bool
+    result: str = ""
+    error: Optional[str] = None
+
+    def as_observation(self) -> str:
+        if self.ok:
+            return self.result
+        return f"TOOL ERROR: {self.error}"
+
+
+@dataclass
+class ToolSpec:
+    name: str
+    description: str
+    parameters: dict            # JSON-schema-ish {name: {"type":..., "required":bool}}
+    fn: Callable[[dict], ToolResult]
+    requires_permission: bool = False
+
+
+class ToolRegistry:
+    def __init__(self, workspace_dir: str = WORKSPACE_DIR, enabled: bool = True,
+                 allow_run_python: bool = True):
+        self.workspace_dir = os.path.abspath(workspace_dir)
+        os.makedirs(self.workspace_dir, exist_ok=True)
+        self.enabled = enabled
+        self.allow_run_python = allow_run_python
+        self.tools: dict[str, ToolSpec] = {}
+        self._register_defaults()
+
+    # ---------- sandboxing ----------
+
+    def _safe_path(self, relative_path: str) -> str:
+        """Resolve a path under the workspace, rejecting any escape attempt."""
+        candidate = os.path.realpath(os.path.join(self.workspace_dir, relative_path))
+        root = os.path.realpath(self.workspace_dir)
+        if candidate != root and not candidate.startswith(root + os.sep):
+            raise PermissionError(f"path '{relative_path}' escapes the sandboxed workspace")
+        return candidate
+
+    # ---------- built-in tools ----------
+
+    def _register_defaults(self):
+        self.tools["read_file"] = ToolSpec(
+            name="read_file",
+            description="Read a UTF-8 text file inside the workspace.",
+            parameters={"path": {"type": "string", "required": True}},
+            fn=self._tool_read_file,
+        )
+        self.tools["write_file"] = ToolSpec(
+            name="write_file",
+            description="Write (overwrite) a UTF-8 text file inside the workspace.",
+            parameters={"path": {"type": "string", "required": True},
+                        "content": {"type": "string", "required": True}},
+            fn=self._tool_write_file,
+            requires_permission=True,
+        )
+        self.tools["list_directory"] = ToolSpec(
+            name="list_directory",
+            description="List files and folders at a path inside the workspace.",
+            parameters={"path": {"type": "string", "required": False}},
+            fn=self._tool_list_directory,
+        )
+        self.tools["run_python"] = ToolSpec(
+            name="run_python",
+            description=(
+                "Run a short Python snippet in a fresh subprocess, cwd set to the "
+                "workspace, with a hard timeout. Use for small computations/checks only."
+            ),
+            parameters={"code": {"type": "string", "required": True},
+                        "timeout_seconds": {"type": "number", "required": False}},
+            fn=self._tool_run_python,
+            requires_permission=True,
+        )
+        self.tools["search_huggingface"] = ToolSpec(
+            name="search_huggingface",
+            description="Search the Hugging Face Hub for models matching a query.",
+            parameters={"query": {"type": "string", "required": True},
+                        "limit": {"type": "number", "required": False}},
+            fn=self._tool_search_huggingface,
+        )
+
+    def schema(self) -> list[dict]:
+        return [
+            {"name": t.name, "description": t.description, "parameters": t.parameters}
+            for t in self.tools.values()
+        ]
+
+    # ---------- dispatch ----------
+
+    def call(self, name: str, arguments: dict) -> ToolResult:
+        if not self.enabled:
+            return ToolResult(ok=False, error="tool registry is disabled")
+        spec = self.tools.get(name)
+        if spec is None:
+            return ToolResult(ok=False, error=f"unknown tool '{name}'")
+        if spec.requires_permission and spec.name == "run_python" and not self.allow_run_python:
+            return ToolResult(ok=False, error="run_python is disabled in settings")
+        missing = [k for k, v in spec.parameters.items() if v.get("required") and k not in arguments]
+        if missing:
+            return ToolResult(ok=False, error=f"missing required arguments: {missing}")
+        try:
+            return spec.fn(arguments)
+        except PermissionError as e:
+            return ToolResult(ok=False, error=str(e))
+        except Exception as e:  # noqa: BLE001 — surfaced to the model as an observation
+            return ToolResult(ok=False, error=f"{type(e).__name__}: {e}")
+
+    # ---------- implementations ----------
+
+    def _tool_read_file(self, args: dict) -> ToolResult:
+        path = self._safe_path(args["path"])
+        if not os.path.isfile(path):
+            return ToolResult(ok=False, error=f"no such file: {args['path']}")
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            content = f.read(200_000)  # cap to keep it out of the model's context blowing up
+        return ToolResult(ok=True, result=content)
+
+    def _tool_write_file(self, args: dict) -> ToolResult:
+        path = self._safe_path(args["path"])
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(args["content"])
+        return ToolResult(ok=True, result=f"wrote {len(args['content'])} bytes to {args['path']}")
+
+    def _tool_list_directory(self, args: dict) -> ToolResult:
+        rel = args.get("path", ".")
+        path = self._safe_path(rel)
+        if not os.path.isdir(path):
+            return ToolResult(ok=False, error=f"no such directory: {rel}")
+        entries = sorted(os.listdir(path))
+        return ToolResult(ok=True, result="\n".join(entries) if entries else "(empty)")
+
+    def _tool_run_python(self, args: dict) -> ToolResult:
+        if not self.allow_run_python:
+            return ToolResult(ok=False, error="run_python is disabled in settings")
+        timeout = float(args.get("timeout_seconds", 8))
+        timeout = min(timeout, 30.0)
+        try:
+            proc = subprocess.run(
+                [sys.executable, "-I", "-c", args["code"]],
+                cwd=self.workspace_dir,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired:
+            return ToolResult(ok=False, error=f"run_python timed out after {timeout}s")
+        out = proc.stdout[-4000:]
+        err = proc.stderr[-2000:]
+        if proc.returncode != 0:
+            return ToolResult(ok=False, error=f"exit {proc.returncode}\nstdout:\n{out}\nstderr:\n{err}")
+        return ToolResult(ok=True, result=out or "(no stdout)")
+
+    def _tool_search_huggingface(self, args: dict) -> ToolResult:
+        try:
+            from huggingface_hub import HfApi
+        except ImportError:
+            return ToolResult(ok=False, error="huggingface_hub is not installed")
+        try:
+            api = HfApi()
+            limit = int(args.get("limit", 5))
+            models = list(api.list_models(search=args["query"], limit=limit))
+            lines = [f"{m.id}  (downloads={getattr(m, 'downloads', '?')})" for m in models]
+            return ToolResult(ok=True, result="\n".join(lines) if lines else "no results")
+        except Exception as e:  # network errors, auth errors, etc.
+            return ToolResult(ok=False, error=f"huggingface search failed: {e}")
