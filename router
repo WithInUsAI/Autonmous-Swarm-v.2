@@ -1,0 +1,51 @@
+"""
+The Router (FunctionGemma) must return a strict schema:
+
+    {"route": "SIMPLE" | "COMPLEX", "confidence": 0.0-1.0, "reason": "..."}
+
+Free-text substring matching ("COMPLEX" in text.upper()) is exactly the
+bug this replaces — a reasoner-style hedge like "This appears simple,
+but there's a wrinkle: it's COMPLEX" used to misroute. Now we require
+the structured field and default to COMPLEX (the safe direction — worst
+case the full swarm runs on an easy task) whenever parsing fails.
+"""
+
+from dataclasses import dataclass
+
+from .json_utils import extract_json
+
+ROUTE_SCHEMA_INSTRUCTIONS = (
+    "Respond with ONLY a JSON object, no other text, matching exactly:\n"
+    '{"route": "SIMPLE" or "COMPLEX", "confidence": <0.0-1.0>, "reason": "<one short clause>"}'
+)
+
+
+@dataclass
+class RouteDecision:
+    route: str          # "SIMPLE" | "COMPLEX"
+    confidence: float
+    reason: str
+    parsed_ok: bool
+
+
+def parse_route(raw_text: str) -> RouteDecision:
+    data = extract_json(raw_text)
+    if not data:
+        return RouteDecision(route="COMPLEX", confidence=0.0,
+                              reason="router output did not parse as JSON — defaulting to full swarm",
+                              parsed_ok=False)
+
+    route = str(data.get("route", "")).strip().upper()
+    if route not in ("SIMPLE", "COMPLEX"):
+        return RouteDecision(route="COMPLEX", confidence=0.0,
+                              reason=f"invalid route value {route!r} — defaulting to full swarm",
+                              parsed_ok=False)
+
+    try:
+        confidence = float(data.get("confidence", 0.5))
+    except (TypeError, ValueError):
+        confidence = 0.5
+    confidence = max(0.0, min(1.0, confidence))
+
+    reason = str(data.get("reason", ""))[:200]
+    return RouteDecision(route=route, confidence=confidence, reason=reason, parsed_ok=True)
