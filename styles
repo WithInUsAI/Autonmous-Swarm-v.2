@@ -1,0 +1,27 @@
+DARK_STYLESHEET = """
+QMainWindow, QWidget { background-color: #0b0d12; color: #e6e8ee; }
+QGraphicsView { background-color: #0b0d12; border: none; }
+QTextEdit, QPlainTextEdit, QListWidget {
+    background-color: #12141c; border: 1px solid #23273154; color: #d7dae1;
+    font-family: Consolas, monospace; font-size: 11px;
+}
+QLineEdit {
+    background-color: #12141c; border: 1px solid #2a2f3d; border-radius: 4px;
+    padding: 6px; color: #e6e8ee;
+}
+QPushButton {
+    background-color: #1b1f2a; border: 1px solid #2a2f3d; border-radius: 4px;
+    padding: 6px 14px; color: #d7dae1;
+}
+QPushButton:hover { background-color: #262b38; border-color: #4fa3ff; }
+QPushButton:disabled { color: #4b4f5a; }
+QLabel#SectionHeader {
+    color: #6b7280; font-weight: bold; font-size: 10px; letter-spacing: 1px;
+    padding-top: 6px;
+}
+QLabel#TitleBar { font-size: 14px; font-weight: bold; letter-spacing: 2px; color: #e6e8ee; }
+QLabel#StatusPill { color: #2fd18f; font-weight: bold; }
+QProgressBar { background-color: #12141c; border: 1px solid #2a2f3d; border-radius: 3px; text-align: center; }
+QProgressBar::chunk { background-color: #4fa3ff; }
+QCheckBox { color: #d7dae1; }
+"""
