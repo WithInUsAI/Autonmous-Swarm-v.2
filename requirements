@@ -1,0 +1,3 @@
+PyQt6>=6.5
+llama-cpp-python>=0.2.90
+huggingface_hub>=0.20   # optional — only needed for the search_huggingface tool
